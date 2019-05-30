@@ -1,7 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.OleDb;
 using System.IO;
+using OfficeOpenXml;
 
 public class XlsxReader
 {
@@ -10,99 +12,140 @@ public class XlsxReader
     /// </summary>
     public static DataSet ReadXlsxFile(string filePath, out string errorString)
     {
-        // 检查文件是否存在且没被打开
-        FileState fileState = Utils.GetFileState(filePath);
-        if (fileState == FileState.Inexist)
-        {
-            errorString = string.Format("{0}文件不存在", filePath);
-            return null;
-        }
-        else if (fileState == FileState.IsOpen)
-        {
-            errorString = string.Format("{0}文件正在被其他软件打开，请关闭后重新运行本工具", filePath);
-            return null;
-        }
-
-        OleDbConnection conn = null;
-        OleDbDataAdapter da = null;
-        DataSet ds = null;
-
+        errorString = "";
+        FileInfo existingFile = new FileInfo(filePath);
         try
         {
-            // 初始化连接并打开
-            string connectionString = "Provider=Microsoft.ACE.OLEDB.12.0;Data Source=" + filePath + ";Extended Properties=\"Excel 12.0;HDR=NO;IMEX=1\"";
-
-            conn = new OleDbConnection(connectionString);
-            conn.Open();
-
-            // 获取数据源的表定义元数据                       
-            DataTable dtSheet = conn.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, new object[] { null, null, null, "TABLE" });
+            ExcelPackage package = new ExcelPackage(existingFile);
+            int vSheetCount = package.Workbook.Worksheets.Count;
+            //Console.WriteLine("sheet count: {0}", vSheetCount);
 
             // 必须存在数据表
             bool isFoundDateSheet = false;
+            var sheetNameData = AppValues.EXCEL_DATA_SHEET_NAME.Replace("$", "");
             // 可选配置表
             bool isFoundConfigSheet = false;
+            var sheetNameConfig = AppValues.EXCEL_CONFIG_SHEET_NAME.Replace("$", "");
 
-            for (int i = 0; i < dtSheet.Rows.Count; ++i)
+            foreach (var s in package.Workbook.Worksheets)
             {
-                string sheetName = dtSheet.Rows[i]["TABLE_NAME"].ToString();
-
-                if (sheetName == AppValues.EXCEL_DATA_SHEET_NAME)
+                //Console.WriteLine(s.Name);
+                var sheetName = s.Name;
+                if (sheetName == sheetNameData)
                     isFoundDateSheet = true;
-                else if (sheetName == AppValues.EXCEL_CONFIG_SHEET_NAME)
+                else if (sheetName == sheetNameConfig)
                     isFoundConfigSheet = true;
             }
             if (!isFoundDateSheet)
             {
-                errorString = string.Format("错误：{0}中不含有Sheet名为{1}的数据表", filePath, AppValues.EXCEL_DATA_SHEET_NAME.Replace("$", ""));
+                errorString = string.Format("错误：{0}中不含有Sheet名为{1}的数据表", filePath, sheetNameData);
                 return null;
             }
 
-            // 初始化适配器
-            da = new OleDbDataAdapter();
-            da.SelectCommand = new OleDbCommand(String.Format("Select * FROM [{0}]", AppValues.EXCEL_DATA_SHEET_NAME), conn);
-
-            ds = new DataSet();
-            da.Fill(ds, AppValues.EXCEL_DATA_SHEET_NAME);
-
-            // 删除表格末尾的空行
-            DataRowCollection rows = ds.Tables[AppValues.EXCEL_DATA_SHEET_NAME].Rows;
-            int rowCount = rows.Count;
-            for (int i = rowCount - 1; i >= AppValues.DATA_FIELD_DATA_START_INDEX; --i)
+            var ds = new DataSet();
+            foreach (var s in package.Workbook.Worksheets)
             {
-                if (string.IsNullOrEmpty(rows[i][0].ToString()))
-                    rows.RemoveAt(i);
+                DataTable dt = ExcelWorksheetToDataTable(s);
+                dt.TableName = s.Name + "$";
+                ds.Tables.Add(dt);
+            }
+            return ds;
+        }
+        catch (Exception err)
+        {
+            errorString = err.Message + "\n" + err.StackTrace;
+        }
+        return null;
+    }
+
+    private static DataTable ExcelWorksheetToDataTable(ExcelWorksheet worksheet)
+    {
+        DataTable dt = new DataTable();
+
+        //check if the worksheet is completely empty
+        if (worksheet.Dimension == null)
+        {
+            return dt;
+        }
+
+        //create a list to hold the column names
+        List<string> columnNames = new List<string>();
+
+        //needed to keep track of empty column headers
+        int currentColumn = 1;
+
+        for (int i = 1; i <= worksheet.Dimension.End.Column; i++)
+        {
+            var cell = worksheet.Cells[1, i];
+
+            string columnName = cell.Text.Trim();
+            //check if the previous header was empty and add it if it was
+            if (cell.Start.Column != currentColumn)
+            {
+                for (; currentColumn < cell.Start.Column; currentColumn++)
+                {
+                    columnNames.Add("Header_" + currentColumn);
+                    dt.Columns.Add("Header_" + currentColumn);
+                }
+                currentColumn = cell.Start.Column;
+            }
+
+            //add the column name to the list to count the duplicates
+            columnNames.Add(columnName);
+
+            //count the duplicate column names and make them unique to avoid the exception
+            //A column named 'Name' already belongs to this DataTable
+            int occurrences = columnNames.FindAll(x => x.Equals(columnName)).Count;
+            if (occurrences > 1)
+            {
+                columnName = columnName + "_" + occurrences;
+            }
+
+            //add the column to the datatable
+            dt.Columns.Add(columnName);
+
+            currentColumn++;
+        }
+
+        //start adding the contents of the excel file to the datatable
+        for (int i = 1; i <= worksheet.Dimension.End.Row; i++)
+        {
+            var row = worksheet.Cells[i, 1, i, worksheet.Dimension.End.Column];
+            var cols = row.Columns;
+            DataRow newRow = dt.NewRow();
+
+            //loop all cells in the row
+            foreach (var cell in row)
+            {
+                var col = cell.Start.Column - 1;
+                if (newRow.ItemArray.Length > col)
+                    newRow[col] = cell.Text;
+            }
+
+            dt.Rows.Add(newRow);
+        }
+
+        if (dt.Rows.Count > 1)
+        {
+            for (int i = dt.Rows.Count - 1; i >= 0; i--)
+            {
+                var row = dt.Rows[i];
+                bool IsNull = true;
+                foreach (var item in row.ItemArray)
+                {
+                    IsNull &= string.IsNullOrEmpty(item.ToString().Trim());
+                }
+                if (IsNull)
+                {
+                    dt.Rows.Remove(row);
+                }
                 else
+                {
                     break;
-            }
-
-            if (isFoundConfigSheet == true)
-            {
-                da.Dispose();
-                da = new OleDbDataAdapter();
-                da.SelectCommand = new OleDbCommand(String.Format("Select * FROM [{0}]", AppValues.EXCEL_CONFIG_SHEET_NAME), conn);
-                da.Fill(ds, AppValues.EXCEL_CONFIG_SHEET_NAME);
-            }
-        }
-        catch
-        {
-            errorString = "错误：连接Excel失败，你可能尚未安装Office数据连接组件: http://www.microsoft.com/en-US/download/details.aspx?id=23734 \n";
-            return null;
-        }
-        finally
-        {
-            // 关闭连接
-            if (conn.State == ConnectionState.Open)
-            {
-                conn.Close();
-                // 由于C#运行机制，即便因为表格中没有Sheet名为data的工作簿而return null，也会继续执行finally，而此时da为空，故需要进行判断处理
-                if (da != null)
-                    da.Dispose();
-                conn.Dispose();
+                }
             }
         }
 
-        errorString = null;
-        return ds;
+        return dt;
     }
 }

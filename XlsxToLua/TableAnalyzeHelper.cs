@@ -1980,6 +1980,7 @@ public class TableAnalyzeHelper
 
         for (int column = 0; column < columnCount; ++column)
         {
+            if (dt.Rows.Count == 0) continue;
             // 取参数名
             string paramName = dt.Rows[AppValues.CONFIG_FIELD_DEFINE_INDEX][column].ToString().Trim();
             if (string.IsNullOrEmpty(paramName))
